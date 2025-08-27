@@ -1,0 +1,360 @@
+---
+title: "mast_report"
+editor: source
+format: 
+ html:
+   embed-resources: true
+   toc: true
+   toc-location: left
+execute:
+    echo: false
+    message: false
+    warning: false
+---
+
+```{r}
+library(tidyverse)
+library(arrow)
+library(dtplyr)
+library(DT)
+library(survival)
+library(survminer)
+library(stringr)
+library(viridis)
+library(RColorBrewer)
+library(flextable)
+library(officer)
+library(gtsummary)
+library(cardx)
+library(htmltools)
+library(lubridate)
+library(httr)
+library(jsonlite)
+library(gt)
+library(scales)
+
+okabe_ito <- c(
+  "#E69F00", # orange
+  "#56B4E9", # sky blue
+  "#009E73", # bluish green
+  "#F0E442", # yellow
+  "#0072B2", # blue
+  "#D55E00", # vermillion
+  "#CC79A7"  # reddish purple
+)
+
+# Initialization and organization of initial data sets
+
+source('functions/DT_base.R') #functions to parse remarks and protocols
+
+# Intialize animal and animal lactation file and assign data pull date to an object for later use.
+animals <- read_parquet('data/intermediate_files/animals.parquet')
+
+animal_lactations<-read_parquet('data/intermediate_files/animal_lactations.parquet') 
+
+pull_date <- unique(animals$data_pull_date_max)
+
+date_start <- pull_date - 365 # pulls last year of data, modify for specific project
+date_end <- pull_date
+
+events_formatted <-read_parquet('data/intermediate_files/events_formatted.parquet')
+
+# Pull the wanted information into a new data sets (double check in DC that the events are actually being recorded under these event names)
+
+# Mastitis
+mastitis_data <- events_formatted %>%
+  filter(event %in% c("MAST", "CULTURE"))
+
+# Lameness
+lame_data <- events_formatted %>%
+  filter(event %in% c("LAME"))
+
+# Reroduction
+repro_data <- events_formatted %>%
+  filter(event_type %in% c("repro"))%>%
+  select(id_animal, id_animal_lact, date_birth, lact_number, event, date_event, dim_event, R)
+
+vwp <- 50 # Set to herd's VWP
+
+# Youngstock
+youngstock_data <- events_formatted%>%
+  filter(lact_number == 0)
+
+# Pull production data from dairy comp and re-format:
+# EVENTS ID BDAT LACT\4S730 (730 = last 2 years of data, change based on goals)
+# Save in data/intermediate_files/production_data. It should be the only file in there
+
+# Define file path
+production_file <- "data/intermediate_files/production_data/production.parquet"
+
+# # Read Parquet file
+production_data <- read_parquet(production_file)
+
+# # Reformat the data
+production_data <- production_data %>%
+  mutate(
+    id_animal = paste0(as.character(ID), "_", as.character(BDAT)) #Create id_animal
+  ) %>%
+  rename(id = ID) %>%
+  rename(date_birth = BDAT)%>%
+  rename(date_test = TestDate) %>%
+  mutate(date_test = mdy(date_test))%>% # Convert to Date (Adjust format if needed)
+  relocate(id_animal, .before = everything())  # Move id_animal to the first column
+
+```
+
+```{r}
+graph <- ggplot(mastitis_data, aes(x = dim_event)) +
+  geom_histogram(binwidth = 10, fill = "steelblue", color = "black", alpha = 0.7) +
+  theme_minimal(base_size = 14) +
+  facet_wrap(vars(event), ncol = 1, scales = "free") +
+  labs(
+    title = "Distribution of Mastitis Events Over Days in Milk",
+    x = "Days in Milk",
+    y = "Count"
+  ) +
+  theme(
+    panel.grid.major = element_line(color = "gray80"),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 14, face = "bold")
+  )
+
+print(graph)
+```
+
+```{r}
+mastitis_data_filtered <- mastitis_data %>%
+  filter(lact_group != "Heifer")
+
+graph <- ggplot(mastitis_data_filtered, aes(x = dim_event, fill = lact_group)) +
+  geom_histogram(binwidth = 30, position = "dodge", color = "black") +
+  scale_fill_manual(values = okabe_ito) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Distribution of Mastitis Events Over Days in Milk by Lactation Group",
+    x = "Days in Milk",
+    y = "Count",
+    fill = "Lactation Group"
+  )
+
+print(graph)
+
+```
+
+```{r}
+ggraph <- ggplot(mastitis_data, aes(x = date_event)) +
+  geom_histogram(binwidth = 10, fill = "steelblue", color = "black", alpha = 0.7) +
+  theme_minimal(base_size = 14) +
+  facet_wrap(vars(event), ncol = 1, scales = "free") +
+  labs(
+    title = "Distribution of Mastitis Events Over Last Year",
+    x = "Date",
+    y = "Count"
+  ) +
+  theme(
+    panel.grid.major = element_line(color = "gray80"),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 14, face = "bold")
+  )
+
+print(ggraph)
+```
+
+```{r}
+
+graph <- ggplot(mastitis_data_filtered, aes(x = date_event, fill = lact_group)) +
+  geom_histogram(binwidth = 30, position = "dodge", color = "black") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Mastitis Events Over Last Year by Lactation Group",
+    x = "Event Date",
+    y = "Count",
+    fill = "Lactation Group"
+  )
+
+print(graph)
+```
+
+```{r}
+summarize_mast_events<-mastitis_data |> 
+  filter(event %in% c("MAST"))|>
+  group_by(event, protocols_remaining_after_numbers1) |> 
+  summarize(count_rows=sum(n()))|>
+  ungroup()%>%
+  mutate(event_type = factor(protocols_remaining_after_numbers1), 
+         Event = factor(event))
+
+facet_order <- summarize_mast_events %>%
+  group_by(event_type) %>%
+  summarise(n_y = n_distinct(event)) %>%
+  arrange(desc(n_y)) %>%  # Order by most y categories
+  pull(event_type)
+
+# order events
+summarize_mast_events <- summarize_mast_events %>%
+  mutate(event_type = fct_reorder(event_type, count_rows, .fun = sum, .desc = FALSE)) 
+
+  ggplot(summarize_mast_events)+
+  geom_bar(aes(x = event_type,
+               y = count_rows, fill = event_type), stat = "identity")+
+  #facet_wrap(factor(event, levels = facet_order) ~., scales = 'free')+
+    facet_wrap(vars(event), ncol = 1, scales = "free")+
+  coord_flip()+
+  scale_fill_viridis_d()+
+  theme_minimal()+
+  labs(x = "",
+       y = "Row Count")+
+  theme(legend.position = "none",
+        # axis.text.y = element_text(size = 6)
+  )
+```
+
+Chronic Cases
+
+```{r}
+
+
+
+mastitis_summary <- mastitis_data %>%
+  filter(event %in% c("MAST"))|>
+  group_by(id_animal_lact, lact_group) %>%       # group by animal and lactation
+  summarise(event_count = n(), .groups = "drop") %>% 
+  mutate(chronic = ifelse(event_count > 1, "Chronic", "Single"))
+
+# View table of how many cows had 1, 2, 3+ events
+mastitis_counts <- mastitis_summary %>%
+  count(event_count)
+
+print(mastitis_counts)
+
+# Plot distribution
+ggplot(mastitis_summary, aes(x = event_count)) +
+  geom_bar(fill = "steelblue", color = "black") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Mastitis Events per Cow per Lactation",
+    x = "Number of Mastitis Events",
+    y = "Number of Cows"
+  )
+  
+```
+
+```{r}
+mastitis_chronic_by_group <- mastitis_summary %>%
+  filter(lact_group != "Heifer") %>%
+  group_by(lact_group, chronic) %>%
+  summarise(n = n(), .groups = "drop_last") %>%
+  mutate(percentage = 100 * n / sum(n)) %>%
+  ungroup()
+
+mastitis_chronic_by_group
+```
+
+```{r}
+ggplot(mastitis_chronic_by_group, aes(x = lact_group, y = percentage, fill = chronic)) +
+  geom_col(position = "fill", color = "black") +  # stacked % bars
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("Single" = "#56B4E9", "Chronic" = "#E69F00")) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Chronic vs Single Mastitis Cases by Lactation Group",
+    x = "Lactation Group",
+    y = "Percentage of Mastitis Events",
+    fill = "Case Type"
+  )
+
+```
+
+```{r}
+# Lookup table as a named vector
+pathogen_lookup <- c(
+  "A" = "S. agalactiae",
+  "B" = "Corynebacterium spp.",
+  "C" = "Staph Species (CNS)",
+  "D" = "Strep dysgalactiae",
+  "E" = "E. coli",
+  "F" = "Enterococcus spp.",
+  "H" = "Prototheca",
+  "K" = "Klebsiella spp.",
+  "M" = "Mycoplasma bovis",
+  "N" = "No growth",
+  "O" = "Other Gram Neg",
+  "R" = "S. aureus",
+  "S" = "Strep Species",
+  "T" = "T. Pyogenes",
+  "U" = "Strep uberis",
+  "X" = "Contamination",
+  "Z" = "Other"
+)
+
+culture_data <- mastitis_data %>%
+  mutate(remark_letters1 = pathogen_lookup[remark_letters1])
+
+# Replace codes with pathogen names
+culture_data <- mastitis_data %>%
+  mutate(remark_letters1 = pathogen_lookup[remark_letters1])
+
+# Summarize counts
+summarize_culture_events <- culture_data %>% 
+  filter(event == "CULTURE") %>%
+  group_by(remark_letters1) %>% 
+  summarise(count_rows = n(), .groups = "drop") %>%
+  mutate(event_type = fct_reorder(remark_letters1, count_rows, .desc = TRUE))
+
+# Plot
+ggplot(summarize_culture_events, aes(x = event_type, y = count_rows, fill = event_type)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_viridis_d() +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Culture Results",
+    x = "",
+    y = "Count"
+  ) +
+  theme(
+    legend.position = "none"
+  )
+
+```
+
+```{r}
+
+# Step 1: Identify top 5 pathogens
+top_5_events <- culture_data |> 
+  count(remark_letters1, name = "total") |> 
+  arrange(desc(total)) |> 
+  slice_head(n = 5) |> 
+  pull(remark_letters1)
+
+# Step 2: Filter dataset & aggregate counts per DIM × event × pathogen
+summarize_culture_events <- culture_data |> 
+  filter(event %in% "CULTURE")|>
+  filter(remark_letters1 %in% top_5_events) |> 
+  count(dim_event, event, remark_letters1, name = "count_rows")
+
+# Step 3: Plot stacked bar graph
+ggplot(summarize_culture_events, aes(x = dim_event, y = count_rows, fill = remark_letters1)) +
+  geom_col(width = 30, position = "stack") + 
+  scale_fill_viridis_d() +
+  scale_x_continuous(
+    breaks = seq(0, max(summarize_culture_events$dim_event, na.rm = TRUE), by = 30)
+  ) +
+  theme_minimal(base_size = 14) +
+  facet_wrap(vars(event), ncol = 1, scales = "free_y") +
+  labs(
+    title = "Stacked Bar Graph of Top 5 Culture Events by Days in Milk",
+    x = "Days in Milk",
+    y = "Count of Events",
+    fill = "Pathogen"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major = element_line(color = "gray80", size = 0.3),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(size = 14, face = "bold"),
+    legend.position = "right"
+  )
+
+
+```
